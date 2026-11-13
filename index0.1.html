@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gastos Compartidos</title>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React 18 + ReactDOM (UMD) -->
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel (transpila JSX en el navegador) -->
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+
+  <!-- Firebase (SDK compat: Realtime Database) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+  <style>
+    input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    // =====================================================================
+    // 1) CONFIGURACIÓN DE FIREBASE  —  reemplazá los marcadores TU_...
+    //    (ver setup.md, paso 4)
+    // =====================================================================
+    const firebaseConfig = {
+      apiKey: "TU_API_KEY_AQUI",
+      authDomain: "TU_PROYECTO_ID.firebaseapp.com",
+      databaseURL: "https://TU_PROYECTO_ID-default-rtdb.firebaseio.com",
+      projectId: "TU_PROYECTO_ID",
+      storageBucket: "TU_PROYECTO_ID.appspot.com",
+      messagingSenderId: "TU_MESSAGING_SENDER_ID",
+      appId: "TU_APP_ID",
+    };
+
+    const CONFIG_OK = !Object.values(firebaseConfig).some((v) => String(v).includes("TU_"));
+
+    let db = null;
+    if (CONFIG_OK) {
+      firebase.initializeApp(firebaseConfig);
+      db = firebase.database();
+    }
+
+    const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+    // =====================================================================
+    // 2) UTILIDADES
+    // =====================================================================
+
+    // Cada grupo de gastos vive en grupos/<id>. El id va en el hash de la URL
+    // (ej: https://usuario.github.io/repo/#viaje-bariloche). Si no hay, se crea uno.
+    function getGroupId() {
+      let g = decodeURIComponent(location.hash.replace(/^#/, "")).replace(/[^a-zA-Z0-9_-]/g, "");
+      if (g.length < 4) {
+        g = Math.random().toString(36).slice(2, 10);
+        history.replaceState(null, "", "#" + g);
+      }
+      return g.slice(0, 40);
+    }
+
+    // Acepta "1234.5", "1234,5", "1.234,50"
+    function parseAmount(text) {
+      let s = String(text).trim().replace(/\s|\$/g, "");
+      if (s.includes(",")) s = s.replace(/\./g, "").replace(",", ".");
+      const n = Number(s);
+      return Number.isFinite(n) ? n : NaN;
+    }
+
+    const moneyFmt = new Intl.NumberFormat("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmtCents = (c) => "$" + moneyFmt.format(c / 100);
+    const fmtAmount = (n) => (Number.isFinite(n) ? moneyFmt.format(n) : "");
+
+    // =====================================================================
+    // 3) ALGORITMO DE LIQUIDACIÓN
+    //    Todo se calcula en centavos enteros para evitar errores de coma flotante.
+    // ==== ALGORITMO ====
+    // =====================================================================
+
+    /**
+     * Balance neto de cada miembro = lo que aportó − lo que consumió.
+     * Un gasto se reparte en partes iguales entre los participantes marcados;
+     * los centavos sobrantes de la división se asignan a los primeros participantes
+     * (en orden de alta), así la suma de cuotas es exactamente igual al gasto.
+     */
+    function computeBalances(members, expenses) {
+      const acc = {};
+      members.forEach((m) => (acc[m.id] = { paid: 0, consumed: 0 }));
+      const warnings = [];
+      let total = 0;
+
+      for (const e of expenses) {
+        const label = (e.desc || "").trim() || "(sin descripción)";
+        const cents = Math.round(Number(e.amount) * 100);
+        const parts = members.filter((m) => e.participants && e.participants[m.id]).map((m) => m.id);
+
+        if (!(cents > 0)) { warnings.push(`"${label}": valor vacío o cero, se omitió.`); continue; }
+        if (!e.payer || !acc[e.payer]) { warnings.push(`"${label}": falta indicar quién pagó, se omitió.`); continue; }
+        if (parts.length === 0) { warnings.push(`"${label}": no tiene participantes marcados, se omitió.`); continue; }
+
+        total += cents;
+        acc[e.payer].paid += cents;
+        const base = Math.floor(cents / parts.length);
+        const rem = cents - base * parts.length;
+        parts.forEach((id, i) => (acc[id].consumed += base + (i < rem ? 1 : 0)));
+      }
+
+      const rows = members.map((m) => ({
+        id: m.id,
+        name: m.name,
+        paid: acc[m.id].paid,
+        consumed: acc[m.id].consumed,
+        net: acc[m.id].paid - acc[m.id].consumed,
+      }));
+      return { rows, warnings, total };
+    }
+
+    /**
+     * Greedy de minimización de flujo de caja:
+     * ordena deudores y acreedores de mayor a menor y hace coincidir siempre
+     * la mayor deuda con el mayor crédito. Cada transferencia salda al menos
+     * a una persona, por lo que un grupo de k personas se liquida con ≤ k−1 transferencias.
+     */
+    function greedySettle(people) {
+      const byAmtDesc = (a, b) => b.amt - a.amt || a.id.localeCompare(b.id);
+      const debtors = people.filter((p) => p.net < 0).map((p) => ({ id: p.id, amt: -p.net })).sort(byAmtDesc);
+      const creditors = people.filter((p) => p.net > 0).map((p) => ({ id: p.id, amt: p.net })).sort(byAmtDesc);
+      const transfers = [];
+
+      while (debtors.length && creditors.length) {
+        const d = debtors[0];
+        const c = creditors[0];
+        const x = Math.min(d.amt, c.amt);
+        transfers.push({ from: d.id, to: c.id, amount: x });
+        d.amt -= x;
+        c.amt -= x;
+        if (d.amt === 0) debtors.shift();
+        if (c.amt === 0) creditors.shift();
+        debtors.sort(byAmtDesc);
+        creditors.sort(byAmtDesc);
+      }
+      return transfers;
+    }
+
+    /**
+     * El greedy solo no garantiza el mínimo absoluto (el problema general es NP-difícil).
+     * El mínimo exacto es  N − G, donde N = personas con saldo ≠ 0 y G = máxima cantidad
+     * de subgrupos disjuntos cuya suma de saldos es cero (cada subgrupo se liquida
+     * internamente con tamaño−1 transferencias).
+     *
+     * Programación dinámica sobre subconjuntos, O(2^N · N):
+     *   dp[mask] = max_{i ∈ mask} dp[mask \ {i}]  +  (suma(mask) == 0 ? 1 : 0)
+     * Reconstruyendo la cadena óptima se obtienen los subgrupos de suma cero.
+     */
+    const EXACT_LIMIT = 18;
+
+    function partitionZeroSum(people) {
+      const n = people.length;
+      const N = 1 << n;
+      const sum = new Float64Array(N); // enteros exactos hasta 2^53
+      for (let m = 1; m < N; m++) {
+        const low = m & -m;
+        const i = 31 - Math.clz32(low);
+        sum[m] = sum[m ^ low] + people[i].net;
+      }
+      const dp = new Int8Array(N);
+      for (let m = 1; m < N; m++) {
+        let best = 0;
+        for (let i = 0; i < n; i++) {
+          if ((m >> i) & 1) {
+            const v = dp[m ^ (1 << i)];
+            if (v > best) best = v;
+          }
+        }
+        dp[m] = best + (sum[m] === 0 ? 1 : 0);
+      }
+      const groups = [];
+      let current = [];
+      let m = N - 1;
+      while (m) {
+        const z = sum[m] === 0 ? 1 : 0;
+        let pick = -1;
+        for (let i = 0; i < n; i++) {
+          if ((m >> i) & 1 && dp[m ^ (1 << i)] + z === dp[m]) { pick = i; break; }
+        }
+        current.push(people[pick]);
+        m ^= 1 << pick;
+        if (sum[m] === 0) { groups.push(current); current = []; }
+      }
+      return groups;
+    }
+
+    function settle(rows) {
+      const people = rows.filter((r) => r.net !== 0).map((r) => ({ id: r.id, net: r.net }));
+      if (people.length === 0) return { transfers: [], method: "none", groups: 0 };
+      if (people.length > EXACT_LIMIT) {
+        return { transfers: greedySettle(people), method: "greedy", groups: 1 };
+      }
+      const groups = partitionZeroSum(people);
+      const transfers = groups.flatMap((g) => greedySettle(g));
+      return { transfers, method: "exact", groups: groups.length };
+    }
+    // ==== FIN ALGORITMO ====
+
+    // =====================================================================
+    // 4) COMPONENTES
+    // =====================================================================
+
+    /** Input que edita localmente y sincroniza con Firebase al salir (blur) o con Enter.
+     *  Mientras tiene foco, no lo pisan los cambios remotos. Esc cancela. */
+    function SyncedInput({ value, onCommit, className = "", ...rest }) {
+      const [draft, setDraft] = useState(value ?? "");
+      const [focused, setFocused] = useState(false);
+      const cancelRef = useRef(false);
+
+      useEffect(() => { if (!focused) setDraft(value ?? ""); }, [value, focused]);
+
+      return (
+        <input
+          {...rest}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onFocus={(e) => { setFocused(true); e.target.select(); }}
+          onBlur={() => {
+            setFocused(false);
+            if (cancelRef.current) { cancelRef.current = false; setDraft(value ?? ""); return; }
+            if (String(draft) !== String(value ?? "")) onCommit(draft);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+            if (e.key === "Escape") { cancelRef.current = true; e.currentTarget.blur(); }
+          }}
+          className={className}
+        />
+      );
+    }
+
+    function SetupNeeded() {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-6">
+          <div className="max-w-lg bg-white rounded-2xl shadow p-8 space-y-4">
+            <h1 className="text-2xl font-bold">Falta configurar Firebase</h1>
+            <p>
+              Abrí <code className="bg-slate-100 px-1 rounded">index.html</code>, buscá el bloque{" "}
+              <code className="bg-slate-100 px-1 rounded">firebaseConfig</code> y reemplazá los marcadores{" "}
+              <code className="bg-slate-100 px-1 rounded">TU_...</code> con las credenciales de tu proyecto.
+            </p>
+            <p className="text-slate-500 text-sm">Las instrucciones paso a paso están en setup.md.</p>
+          </div>
+        </div>
+      );
+    }
+
+    function Ledger({ groupId }) {
+      const [data, setData] = useState(null);
+      const [error, setError] = useState(null);
+      const [connected, setConnected] = useState(false);
+      const [newMember, setNewMember] = useState("");
+      const [newDesc, setNewDesc] = useState("");
+      const [newAmount, setNewAmount] = useState("");
+      const [result, setResult] = useState(null);
+      const [toast, setToast] = useState("");
+
+      const base = useMemo(() => db.ref(`grupos/${groupId}`), [groupId]);
+
+      // ---- Listener en tiempo real -------------------------------------
+      useEffect(() => {
+        const onValue = base.on(
+          "value",
+          (snap) => { setData(snap.val() || {}); setError(null); },
+          (err) => setError(err.message)
+        );
+        const connRef = db.ref(".info/connected");
+        const onConn = connRef.on("value", (s) => setConnected(!!s.val()));
+        return () => { base.off("value", onValue); connRef.off("value", onConn); };
+      }, [base]);
+
+      const members = useMemo(
+        () => Object.entries(data?.members || {})
+          .map(([id, v]) => ({ id, name: v.name || "" }))
+          .sort((a, b) => (a.id < b.id ? -1 : 1)), // las push-keys son cronológicas
+        [data]
+      );
+      const expenses = useMemo(
+        () => Object.entries(data?.expenses || {})
+          .map(([id, v]) => ({ id, desc: v.desc || "", amount: v.amount ?? 0, payer: v.payer || "", participants: v.participants || {} }))
+          .sort((a, b) => (a.id < b.id ? -1 : 1)),
+        [data]
+      );
+      const signature = useMemo(() => JSON.stringify([members, expenses]), [members, expenses]);
+      const nameOf = useCallback((id) => members.find((m) => m.id === id)?.name || "?", [members]);
+      const totalCents = expenses.reduce((s, e) => s + Math.round(Number(e.amount) * 100 || 0), 0);
+
+      const flash = (msg) => { setToast(msg); setTimeout(() => setToast(""), 2200); };
+      const fail = (err) => flash("Error al guardar: " + err.message);
+
+      // ---- Acciones (cada una escribe en Firebase) ---------------------
+      function addMember(e) {
+        e.preventDefault();
+        const name = newMember.trim().slice(0, 40);
+        if (!name) return;
+        if (members.some((m) => m.name.toLowerCase() === name.toLowerCase())) { flash("Ya existe un miembro con ese nombre"); return; }
+        const key = base.child("members").push().key;
+        const updates = { [`members/${key}`]: { name } };
+        // El nuevo miembro queda desmarcado en los gastos existentes.
+        base.update(updates).catch(fail);
+        setNewMember("");
+      }
+
+      function renameMember(id, name) {
+        name = name.trim().slice(0, 40);
+        if (!name) return;
+        base.child(`members/${id}/name`).set(name).catch(fail);
+      }
+
+      function removeMember(id) {
+        if (!confirm(`¿Eliminar a ${nameOf(id)}? Se quitará de todos los gastos.`)) return;
+        const updates = { [`members/${id}`]: null };
+        expenses.forEach((e) => {
+          updates[`expenses/${e.id}/participants/${id}`] = null;
+          if (e.payer === id) updates[`expenses/${e.id}/payer`] = null;
+        });
+        base.update(updates).catch(fail);
+      }
+
+      function addExpense(e) {
+        e.preventDefault();
+        const amount = newAmount.trim() === "" ? 0 : parseAmount(newAmount);
+        if (!Number.isFinite(amount) || amount < 0) { flash("Valor inválido"); return; }
+        const participants = {};
+        members.forEach((m) => (participants[m.id] = true)); // por defecto participan todos
+        const exp = {
+          desc: newDesc.trim().slice(0, 80) || "Gasto",
+          amount: Math.round(amount * 100) / 100,
+          participants,
+        };
+        if (members[0]) exp.payer = members[0].id;
+        base.child("expenses").push(exp).catch(fail);
+        setNewDesc("");
+        setNewAmount("");
+      }
+
+      const updateExpense = (id, field, value) =>
+        base.child(`expenses/${id}/${field}`).set(value === "" ? null : value).catch(fail);
+
+      function commitAmount(id, text) {
+        const n = text.trim() === "" ? 0 : parseAmount(text);
+        if (!Number.isFinite(n) || n < 0) { flash("Valor inválido"); return; }
+        updateExpense(id, "amount", Math.round(n * 100) / 100);
+      }
+
+      const toggleParticipant = (eid, mid, checked) =>
+        base.child(`expenses/${eid}/participants/${mid}`).set(checked ? true : null).catch(fail);
+
+      function setAllParticipants(eid, checked) {
+        const updates = {};
+        members.forEach((m) => (updates[`expenses/${eid}/participants/${m.id}`] = checked ? true : null));
+        base.update(updates).catch(fail);
+      }
+
+      function removeExpense(id, desc) {
+        if (!confirm(`¿Eliminar el gasto "${desc || "sin descripción"}"?`)) return;
+        base.child(`expenses/${id}`).remove().catch(fail);
+      }
+
+      // ---- Cálculo -----------------------------------------------------
+      function calculate() {
+        const bal = computeBalances(members, expenses);
+        const s = settle(bal.rows);
+        setResult({ ...bal, ...s, signature });
+      }
+
+      function copyResult() {
+        if (!result) return;
+        const lines = result.transfers.length
+          ? result.transfers.map((t) => `• ${nameOf(t.from)} → ${nameOf(t.to)}: ${fmtCents(t.amount)}`)
+          : ["Nadie le debe nada a nadie 🎉"];
+        navigator.clipboard.writeText(`Liquidación (total ${fmtCents(result.total)}):\n` + lines.join("\n"))
+          .then(() => flash("Resultado copiado"));
+      }
+
+      function copyLink() {
+        navigator.clipboard.writeText(location.href).then(() => flash("Enlace copiado: compartilo con el grupo"));
+      }
+
+      // ---- Render ------------------------------------------------------
+      if (error) {
+        return (
+          <div className="max-w-xl mx-auto mt-16 bg-white rounded-2xl shadow p-8">
+            <h1 className="text-xl font-bold text-rose-600 mb-2">No se pudo leer la base de datos</h1>
+            <p className="text-slate-600 mb-2">{error}</p>
+            <p className="text-sm text-slate-500">Revisá la URL de la base (databaseURL) y las reglas de seguridad (setup.md, paso 3).</p>
+          </div>
+        );
+      }
+
+      if (data === null) {
+        return <div className="min-h-screen flex items-center justify-center text-slate-500">Conectando…</div>;
+      }
+
+      const stale = result && result.signature !== signature;
+
+      return (
+        <div className="max-w-6xl mx-auto px-3 sm:px-4 py-4 sm:py-6 space-y-4 sm:space-y-6">
+          {/* Encabezado */}
+          <header className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight">Gastos Compartidos</h1>
+              <p className="text-sm text-slate-500">
+                Grupo <span className="font-mono bg-white px-1.5 py-0.5 rounded border">{groupId}</span>
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full ${connected ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
+                <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-500" : "bg-amber-500 animate-pulse"}`} />
+                {connected ? "En línea" : "Sin conexión"}
+              </span>
+              <button onClick={copyLink} className="text-sm px-3 py-1.5 rounded-lg border bg-white hover:bg-slate-50">
+                Copiar enlace
+              </button>
+            </div>
+          </header>
+
+          {/* Controles globales */}
+          <section className="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
+            <form onSubmit={addMember} className="bg-white rounded-2xl shadow-sm border p-3 sm:p-4 flex gap-2">
+              <input
+                value={newMember}
+                onChange={(e) => setNewMember(e.target.value)}
+                placeholder="Nombre del miembro"
+                maxLength={40}
+                className="flex-1 min-w-0 rounded-lg border px-3 py-2 text-base focus:outline-none focus:ring-2 focus:ring-indigo-400"
+              />
+              <button className="shrink-0 rounded-lg bg-indigo-600 text-white px-4 py-2 font-medium hover:bg-indigo-700 disabled:opacity-40" disabled={!newMember.trim()}>
+                <span className="sm:hidden">+ Miembro</span><span className="hidden sm:inline">Agregar Miembro</span>
+              </button>
+            </form>
+            <form onSubmit={addExpense} className="bg-white rounded-2xl shadow-sm border p-3 sm:p-4 flex flex-wrap sm:flex-nowrap gap-2">
+              <input
+                value={newDesc}
+                onChange={(e) => setNewDesc(e.target.value)}
+                placeholder="Rubro / descripción"
+                maxLength={80}
+                className="w-full sm:w-auto sm:flex-1 min-w-0 rounded-lg border px-3 py-2 text-base focus:outline-none focus:ring-2 focus:ring-indigo-400"
+              />
+              <input
+                value={newAmount}
+                onChange={(e) => setNewAmount(e.target.value)}
+                placeholder="Valor"
+                inputMode="decimal"
+                className="flex-1 sm:flex-none sm:w-28 min-w-0 rounded-lg border px-3 py-2 text-base text-right focus:outline-none focus:ring-2 focus:ring-indigo-400"
+              />
+              <button className="shrink-0 rounded-lg bg-indigo-600 text-white px-4 py-2 font-medium hover:bg-indigo-700">
+                <span className="sm:hidden">+ Gasto</span><span className="hidden sm:inline">Agregar Gasto</span>
+              </button>
+            </form>
+          </section>
+
+          {/* Matriz */}
+          <section className="bg-white rounded-2xl shadow-sm border overflow-hidden">
+            {members.length === 0 && expenses.length === 0 ? (
+              <div className="p-10 text-center text-slate-500">
+                Empezá agregando los miembros del grupo y después los gastos.
+              </div>
+            ) : (
+              <>
+              {/* Vista escritorio: tabla (md en adelante) */}
+              <div className="hidden md:block overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-slate-50 text-slate-600">
+                    <tr>
+                      <th className="sticky left-0 z-10 bg-slate-50 text-left font-semibold px-3 py-3 min-w-[260px]">Gasto · Valor</th>
+                      <th className="text-left font-semibold px-3 py-3 min-w-[140px]">Quién pagó</th>
+                      {members.map((m) => (
+                        <th key={m.id} className="px-2 py-2 min-w-[110px]">
+                          <div className="flex items-center justify-center gap-1 group">
+                            <SyncedInput
+                              value={m.name}
+                              onCommit={(v) => renameMember(m.id, v)}
+                              maxLength={40}
+                              title="Clic para renombrar"
+                              className="w-full max-w-[110px] text-center font-semibold bg-transparent rounded px-1 py-0.5 hover:bg-white focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                            />
+                            <button
+                              onClick={() => removeMember(m.id)}
+                              title={`Eliminar a ${m.name}`}
+                              className="text-slate-300 hover:text-rose-600 opacity-60 group-hover:opacity-100"
+                            >×</button>
+                          </div>
+                        </th>
+                      ))}
+                      <th className="px-3 py-3 w-24"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {expenses.length === 0 && (
+                      <tr><td colSpan={members.length + 3} className="p-6 text-center text-slate-400">Todavía no hay gastos.</td></tr>
+                    )}
+                    {expenses.map((e) => {
+                      const nParts = members.filter((m) => e.participants[m.id]).length;
+                      const share = nParts ? Number(e.amount) / nParts : 0;
+                      return (
+                        <tr key={e.id} className="hover:bg-slate-50/60">
+                          <td className="sticky left-0 z-10 bg-white px-3 py-2">
+                            <div className="flex gap-2">
+                              <SyncedInput
+                                value={e.desc}
+                                onCommit={(v) => updateExpense(e.id, "desc", v.trim().slice(0, 80))}
+                                maxLength={80}
+                                placeholder="Descripción"
+                                className="flex-1 min-w-0 rounded-md border border-transparent hover:border-slate-200 px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                              />
+                              <div className="relative w-28">
+                                <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400">$</span>
+                                <SyncedInput
+                                  value={fmtAmount(Number(e.amount))}
+                                  onCommit={(v) => commitAmount(e.id, v)}
+                                  inputMode="decimal"
+                                  className="w-full rounded-md border border-slate-200 pl-5 pr-2 py-1.5 text-right tabular-nums focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                                />
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <select
+                              value={e.payer && members.some((m) => m.id === e.payer) ? e.payer : ""}
+                              onChange={(ev) => updateExpense(e.id, "payer", ev.target.value)}
+                              className={`w-full rounded-md border px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 ${!e.payer ? "border-amber-400 text-amber-700" : ""}`}
+                            >
+                              <option value="">— elegir —</option>
+                              {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                            </select>
+                          </td>
+                          {members.map((m) => (
+                            <td key={m.id} className="px-2 py-2 text-center">
+                              <label className="inline-flex flex-col items-center cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={!!e.participants[m.id]}
+                                  onChange={(ev) => toggleParticipant(e.id, m.id, ev.target.checked)}
+                                  className="h-5 w-5 accent-indigo-600 cursor-pointer"
+                                />
+                                {e.participants[m.id] && share > 0 && (
+                                  <span className="text-[10px] text-slate-400 tabular-nums mt-0.5">{fmtAmount(share)}</span>
+                                )}
+                              </label>
+                            </td>
+                          ))}
+                          <td className="px-3 py-2 whitespace-nowrap text-right">
+                            <button onClick={() => setAllParticipants(e.id, nParts !== members.length)} className="text-xs text-indigo-600 hover:underline mr-2" title="Marcar / desmarcar a todos">
+                              {nParts === members.length ? "Ninguno" : "Todos"}
+                            </button>
+                            <button onClick={() => removeExpense(e.id, e.desc)} className="text-slate-400 hover:text-rose-600" title="Eliminar gasto">🗑</button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  {expenses.length > 0 && (
+                    <tfoot className="bg-slate-50 font-semibold">
+                      <tr>
+                        <td className="sticky left-0 z-10 bg-slate-50 px-3 py-3">Total: <span className="tabular-nums">{fmtCents(totalCents)}</span></td>
+                        <td colSpan={members.length + 2} className="px-3 py-3 text-slate-500 font-normal">
+                          {expenses.length} gasto{expenses.length !== 1 && "s"} · {members.length} miembro{members.length !== 1 && "s"}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  )}
+                </table>
+              </div>
+
+              {/* Vista celular: una tarjeta por gasto (debajo de md) */}
+              <div className="md:hidden divide-y">
+                {members.length > 0 && (
+                  <div className="p-3 bg-slate-50">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Miembros ({members.length})</p>
+                    <div className="flex flex-wrap gap-2">
+                      {members.map((m) => (
+                        <div key={m.id} className="flex items-center bg-white border rounded-full pl-1 pr-1">
+                          <SyncedInput
+                            value={m.name}
+                            onCommit={(v) => renameMember(m.id, v)}
+                            maxLength={40}
+                            size={Math.max(3, Math.min(m.name.length, 14))}
+                            className="bg-transparent text-base font-medium px-2 py-1 rounded-full focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                          />
+                          <button
+                            onClick={() => removeMember(m.id)}
+                            aria-label={`Eliminar a ${m.name}`}
+                            className="h-7 w-7 flex items-center justify-center rounded-full text-slate-400 active:bg-rose-50 active:text-rose-600 text-lg leading-none"
+                          >×</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {expenses.length === 0 && (
+                  <div className="p-6 text-center text-slate-400">Todavía no hay gastos.</div>
+                )}
+
+                {expenses.map((e) => {
+                  const nParts = members.filter((m) => e.participants[m.id]).length;
+                  const share = nParts ? Number(e.amount) / nParts : 0;
+                  return (
+                    <div key={e.id} className="p-3 space-y-2.5">
+                      <div className="flex gap-2">
+                        <SyncedInput
+                          value={e.desc}
+                          onCommit={(v) => updateExpense(e.id, "desc", v.trim().slice(0, 80))}
+                          maxLength={80}
+                          placeholder="Descripción"
+                          className="flex-1 min-w-0 text-base font-semibold rounded-lg border border-transparent px-2 py-1.5 focus:border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                        />
+                        <button onClick={() => removeExpense(e.id, e.desc)} aria-label="Eliminar gasto" className="shrink-0 h-9 w-9 flex items-center justify-center rounded-lg text-slate-400 active:bg-rose-50">🗑</button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="relative">
+                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">$</span>
+                          <SyncedInput
+                            value={fmtAmount(Number(e.amount))}
+                            onCommit={(v) => commitAmount(e.id, v)}
+                            inputMode="decimal"
+                            className="w-full rounded-lg border border-slate-200 pl-6 pr-3 py-2 text-base text-right tabular-nums focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                          />
+                        </div>
+                        <select
+                          value={e.payer && members.some((m) => m.id === e.payer) ? e.payer : ""}
+                          onChange={(ev) => updateExpense(e.id, "payer", ev.target.value)}
+                          aria-label="Quién pagó"
+                          className={`w-full min-w-0 rounded-lg border px-2 py-2 text-base bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 ${!e.payer ? "border-amber-400 text-amber-700" : ""}`}
+                        >
+                          <option value="">Pagó: —</option>
+                          {members.map((m) => <option key={m.id} value={m.id}>Pagó: {m.name}</option>)}
+                        </select>
+                      </div>
+                      {members.length > 0 && (
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs text-slate-500">
+                              Participan {nParts}/{members.length}{share > 0 && ` · $${fmtAmount(share)} c/u`}
+                            </span>
+                            <button onClick={() => setAllParticipants(e.id, nParts !== members.length)} className="text-xs font-medium text-indigo-600 px-2 py-1">
+                              {nParts === members.length ? "Ninguno" : "Todos"}
+                            </button>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {members.map((m) => {
+                              const on = !!e.participants[m.id];
+                              return (
+                                <label
+                                  key={m.id}
+                                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm cursor-pointer select-none ${on ? "bg-indigo-50 border-indigo-300 text-indigo-800" : "bg-white border-slate-200 text-slate-400"}`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={on}
+                                    onChange={(ev) => toggleParticipant(e.id, m.id, ev.target.checked)}
+                                    className="h-4 w-4 accent-indigo-600"
+                                  />
+                                  {m.name}
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {expenses.length > 0 && (
+                  <div className="p-3 bg-slate-50 flex items-center justify-between text-sm">
+                    <span className="text-slate-500">{expenses.length} gasto{expenses.length !== 1 && "s"} · {members.length} miembro{members.length !== 1 && "s"}</span>
+                    <span className="font-semibold tabular-nums">Total {fmtCents(totalCents)}</span>
+                  </div>
+                )}
+              </div>
+              </>
+            )}
+          </section>
+
+          {/* Liquidación */}
+          <section className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={calculate}
+              disabled={members.length < 2 || expenses.length === 0}
+              className="w-full sm:w-auto rounded-xl bg-emerald-600 text-white px-6 py-3 font-semibold shadow hover:bg-emerald-700 disabled:opacity-40"
+            >
+              Calcular Liquidación
+            </button>
+            {stale && <span className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">Los datos cambiaron desde el último cálculo. Volvé a calcular.</span>}
+          </section>
+
+          {result && (
+            <section className={`grid lg:grid-cols-2 gap-4 ${stale ? "opacity-60" : ""}`}>
+              <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-lg font-bold">Transferencias</h2>
+                  <button onClick={copyResult} className="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">Copiar</button>
+                </div>
+                {result.transfers.length === 0 ? (
+                  <p className="text-slate-500">Nadie le debe nada a nadie 🎉</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {result.transfers.map((t, i) => (
+                      <li key={i} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl bg-slate-50 border px-3 sm:px-4 py-3">
+                        <span className="font-semibold text-rose-700">{nameOf(t.from)}</span>
+                        <span className="text-slate-500">debe transferir</span>
+                        <span className="font-bold tabular-nums">{fmtCents(t.amount)}</span>
+                        <span className="text-slate-500">a</span>
+                        <span className="font-semibold text-emerald-700">{nameOf(t.to)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="text-xs text-slate-400 mt-4">
+                  {result.transfers.length} transferencia{result.transfers.length !== 1 && "s"}.{" "}
+                  {result.method === "exact" && "Cantidad mínima garantizada (búsqueda de subgrupos que se compensan + greedy)."}
+                  {result.method === "greedy" && "Calculado con el greedy (grupo grande): como máximo N−1 transferencias."}
+                </p>
+                {result.warnings.length > 0 && (
+                  <ul className="mt-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3 list-disc list-inside space-y-0.5">
+                    {result.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                  </ul>
+                )}
+              </div>
+
+              <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-5">
+                <h2 className="text-lg font-bold mb-4">Balances netos</h2>
+                <table className="w-full text-xs sm:text-sm">
+                  <thead className="text-slate-500">
+                    <tr>
+                      <th className="text-left font-medium pb-2">Miembro</th>
+                      <th className="text-right font-medium pb-2">Aportó</th>
+                      <th className="text-right font-medium pb-2">Consumió</th>
+                      <th className="text-right font-medium pb-2">Neto</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y tabular-nums">
+                    {result.rows.map((r) => (
+                      <tr key={r.id}>
+                        <td className="py-2 font-medium">{r.name}</td>
+                        <td className="py-2 text-right">{fmtCents(r.paid)}</td>
+                        <td className="py-2 text-right">{fmtCents(r.consumed)}</td>
+                        <td className={`py-2 text-right font-semibold ${r.net > 0 ? "text-emerald-600" : r.net < 0 ? "text-rose-600" : "text-slate-400"}`}>
+                          {r.net > 0 ? "+" : r.net < 0 ? "−" : ""}{fmtCents(Math.abs(r.net))}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="text-xs text-slate-400 mt-3">Positivo: le deben. Negativo: debe.</p>
+              </div>
+            </section>
+          )}
+
+          {toast && (
+            <div className="fixed bottom-6 left-1/2 -translate-x-1/2 w-max max-w-[90vw] text-center bg-slate-900 text-white text-sm px-4 py-2 rounded-lg shadow-lg">
+              {toast}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function App() {
+      const groupId = useMemo(getGroupId, []);
+      useEffect(() => {
+        const onHash = () => location.reload(); // cambiar de grupo editando el hash
+        window.addEventListener("hashchange", onHash);
+        return () => window.removeEventListener("hashchange", onHash);
+      }, []);
+      if (!CONFIG_OK) return <SetupNeeded />;
+      return <Ledger groupId={groupId} />;
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
